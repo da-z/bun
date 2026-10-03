@@ -5,7 +5,18 @@
  *
  * A handful of older tests do not run in Node in this file. These tests should be updated to run in Node, or deleted.
  */
-import { bunEnv, bunExe, exampleSite, isASAN, isCI, isDebug, isWindows, randomPort, tls as tlsCert } from "harness";
+import {
+  bunEnv,
+  bunExe,
+  exampleSite,
+  isASAN,
+  isCI,
+  isDebug,
+  isWindows,
+  randomPort,
+  tempDir,
+  tls as tlsCert,
+} from "harness";
 import { createTest } from "node-harness";
 import { EventEmitter, once } from "node:events";
 import nodefs from "node:fs";
@@ -3336,6 +3347,23 @@ describe("a dispatch that throws while an earlier response on the connection is 
       });
     });
   }
+  it.concurrent(
+    "a write() that rejects its chunk throws in the dispatch, not at the turn of the response",
+    async () => {
+      expect(await run("bad-chunk")).toEqual({
+        result: {
+          events: [
+            "request /first",
+            "request /second",
+            'uncaught: The "chunk" argument must be of type string or an instance of Buffer or Uint8Array. Received type number (123)',
+          ],
+          bodies: ["first-done"],
+          closed: false,
+        },
+        exitCode: 0,
+      });
+    },
+  );
   // The response ahead has ended, and most of its 8 MB are still in the send buffer when the
   // connection is reset at the turn of the response behind it. A destroyed queued response
   // resets the connection in the same way, with no throw.
@@ -3476,6 +3504,607 @@ describe.concurrent.each(["tcp", "tls"])(
     );
   },
 );
+
+// Node runs the checks of write_() in the write() or end() call: the chunk type, and the body
+// length when res.strictContentLength is set. The listener can catch the error and answer.
+// A response that waits behind a pipelined one (res.socket === null) used to run them when it got
+// the connection: an uncaught exception, a response with no end, and a connection that stays open.
+describe("write() and end() check their arguments in the call", () => {
+  const firstResponse =
+    "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nContent-Length: 5\r\n\r\nfirst";
+  const chunkType = (received: string) => ({
+    name: "TypeError",
+    code: "ERR_INVALID_ARG_TYPE",
+    message: `The "chunk" argument must be of type string or an instance of Buffer or Uint8Array. Received ${received}`,
+  });
+  const lengthMismatch = (body: number, header: number) => ({
+    name: "Error",
+    code: "ERR_HTTP_CONTENT_LENGTH_MISMATCH",
+    message: `Response body's content-length of ${body} byte(s) does not match the content-length of ${header} byte(s) set in header`,
+  });
+  function caught(call: () => unknown) {
+    try {
+      call();
+    } catch (e: any) {
+      return { name: e.name, code: e.code, message: e.message };
+    }
+  }
+
+  type Exchange = {
+    // A request is ahead on the connection. Its response ends after `listener` ran, so the response of `listener` is queued.
+    queued: boolean;
+    listener: (res: ServerResponse, req: IncomingMessage) => unknown;
+    // Ends the response ahead.
+    endFirst?: (first: ServerResponse) => void;
+    // For a response that never ends: when to stop reading. The default is the close of the connection.
+    until?: (wire: string) => boolean;
+    // With `until`: stop reading only after this too.
+    stop?: Promise<unknown>;
+    // The request of `listener` does not ask for the close of the connection. This needs `until`.
+    keepAlive?: boolean;
+  };
+  // "tcp" is a connection of the server's own listener. "duplex" is a stream given to 'connection',
+  // which the server reads with its JS parser, like the HTTP/1 connections of an http2 server with allowHTTP1.
+  async function exchange(transport: string, { queued, listener, endFirst, until, stop, keepAlive }: Exchange) {
+    let first: ServerResponse | undefined;
+    const ran = Promise.withResolvers<{ socket: string; result: unknown }>();
+    const server = createServer((req, res) => {
+      if (req.url === "/first") {
+        first = res;
+        return;
+      }
+      try {
+        ran.resolve({ socket: res.socket === null ? "none" : "assigned", result: listener(res, req) });
+      } catch (e) {
+        ran.reject(e);
+      }
+      if (first) (endFirst ?? (res => res.end("first")))(first);
+    });
+    let client: Duplex | undefined;
+    try {
+      if (transport === "tcp") {
+        await once(server.listen(0, "127.0.0.1"), "listening");
+        client = connect((server.address() as AddressInfo).port, "127.0.0.1");
+      } else {
+        const [clientSide, serverSide] = duplexPair();
+        server.emit("connection", serverSide);
+        client = clientSide;
+      }
+      let wire = "";
+      let stopped = !stop;
+      const done = Promise.withResolvers<void>();
+      const check = () => {
+        if (stopped && until?.(wire)) done.resolve();
+      };
+      stop?.then(() => {
+        stopped = true;
+        check();
+      });
+      client.on("data", chunk => {
+        wire += chunk.toString("latin1");
+        check();
+      });
+      client.on("end", () => done.resolve());
+      client.on("close", () => done.resolve());
+      client.on("error", done.reject);
+      client.write(
+        (queued ? "GET /first HTTP/1.1\r\nHost: x\r\n\r\n" : "") +
+          `GET /second HTTP/1.1\r\nHost: x\r\n${keepAlive ? "" : "Connection: close\r\n"}\r\n`,
+      );
+      const { socket, result } = await ran.promise;
+      await done.promise;
+      return { socket, result, wire: wire.replace(/Date: [^\r]+\r\n/g, "") };
+    } finally {
+      client?.destroy();
+      server.closeAllConnections();
+      if (server.listening) server.close();
+    }
+  }
+
+  const answer500 = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 1\r\n\r\nE";
+  // Each listener catches the error and then answers, so the bytes show what the failed call left behind.
+  const rows: [string, (res: ServerResponse) => unknown, unknown, string][] = [
+    [
+      "write(123) throws and commits nothing",
+      res => {
+        const threw = caught(() => res.write(123 as any));
+        const headersSent = res.headersSent;
+        res.statusCode = 500;
+        res.end("E");
+        return { threw, headersSent };
+      },
+      { threw: chunkType("type number (123)"), headersSent: false },
+      answer500,
+    ],
+    [
+      "end({}) throws and does not finish the response",
+      res => {
+        const threw = caught(() => res.end({} as any));
+        const finished = res.finished;
+        res.statusCode = 500;
+        res.end("E");
+        return { threw, finished };
+      },
+      { threw: chunkType("an instance of Object"), finished: false },
+      answer500,
+    ],
+    [
+      "write(123) does not call a patched writeHead()",
+      res => {
+        const calls: unknown[] = [];
+        const writeHead = res.writeHead;
+        res.writeHead = function (this: ServerResponse, ...args: any[]) {
+          calls.push(args[0]);
+          return writeHead.apply(this, args as any);
+        } as any;
+        const threw = caught(() => res.write(123 as any));
+        const headersSent = res.headersSent;
+        res.statusCode = 500;
+        res.end("E");
+        return { threw, headersSent, calls };
+      },
+      { threw: chunkType("type number (123)"), headersSent: false, calls: [500] },
+      answer500,
+    ],
+    [
+      "end({}) does not call a patched writeHead()",
+      res => {
+        const calls: unknown[] = [];
+        const writeHead = res.writeHead;
+        res.writeHead = function (this: ServerResponse, ...args: any[]) {
+          calls.push(args[0]);
+          return writeHead.apply(this, args as any);
+        } as any;
+        const threw = caught(() => res.end({} as any));
+        const headersSent = res.headersSent;
+        res.statusCode = 500;
+        res.end("E");
+        return { threw, headersSent, calls };
+      },
+      { threw: chunkType("an instance of Object"), headersSent: false, calls: [500] },
+      answer500,
+    ],
+    [
+      "write(123) after a write() keeps the head and the first chunk",
+      res => {
+        res.write("ok");
+        const threw = caught(() => res.write(123 as any));
+        const headersSent = res.headersSent;
+        res.end("E");
+        return { threw, headersSent };
+      },
+      { threw: chunkType("type number (123)"), headersSent: true },
+      "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n1\r\nE\r\n0\r\n\r\n",
+    ],
+    [
+      "end(0) is an end with no chunk",
+      res => caught(() => res.end(0 as any)),
+      undefined,
+      "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+    ],
+    [
+      "end(0n) is an end with no chunk",
+      res => caught(() => res.end(0n as any)),
+      undefined,
+      "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+    ],
+    [
+      "strictContentLength: a write() over the Content-Length of writeHead() throws",
+      res => {
+        res.strictContentLength = true;
+        res.writeHead(200, { "Content-Length": "1" });
+        const threw = caught(() => res.write("ok"));
+        res.end("E");
+        return threw;
+      },
+      lengthMismatch(2, 1),
+      "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nE",
+    ],
+    [
+      "strictContentLength: an end() that does not meet the Content-Length of writeHead() throws",
+      res => {
+        res.strictContentLength = true;
+        res.writeHead(200, { "Content-Length": "1" });
+        const threw = caught(() => res.end("ok"));
+        const finished = res.finished;
+        res.end("E");
+        return { threw, finished };
+      },
+      { threw: lengthMismatch(2, 1), finished: false },
+      "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nE",
+    ],
+    [
+      "strictContentLength: the write() that stores the head is counted, the next one is checked",
+      res => {
+        res.strictContentLength = true;
+        res.setHeader("Content-Length", "3");
+        res.write("ok");
+        const threw = caught(() => res.write("ok"));
+        res.end("E");
+        return threw;
+      },
+      lengthMismatch(4, 3),
+      "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nokE",
+    ],
+    [
+      "setHeader() after the first write() throws",
+      res => {
+        res.write("a");
+        const threw = caught(() => res.setHeader("x-late", "1"));
+        res.end();
+        return threw;
+      },
+      { name: "Error", code: "ERR_HTTP_HEADERS_SENT", message: "Cannot set headers after they are sent to the client" },
+      "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n",
+    ],
+    [
+      "an invalid statusCode throws from end()",
+      res => {
+        res.statusCode = 1000;
+        const threw = caught(() => res.end("x"));
+        res.statusCode = 500;
+        res.end("E");
+        return threw?.name;
+      },
+      "RangeError",
+      answer500,
+    ],
+    [
+      "an invalid statusMessage throws from write()",
+      res => {
+        res.statusMessage = "a\nb";
+        const threw = caught(() => res.write("x"));
+        res.statusMessage = "Internal Server Error";
+        res.statusCode = 500;
+        res.end("E");
+        return threw;
+      },
+      { name: "TypeError", code: "ERR_INVALID_CHAR", message: "Invalid character in statusMessage" },
+      answer500,
+    ],
+  ];
+
+  for (const transport of ["tcp", "duplex"]) {
+    describe(transport, () => {
+      for (const queued of [true, false]) {
+        for (const [title, listener, result, response] of rows) {
+          it(`${queued ? "queued" : "current"} response: ${title}`, async () => {
+            expect(await exchange(transport, { queued, listener })).toEqual({
+              socket: queued ? "none" : "assigned",
+              result,
+              wire: (queued ? firstResponse : "") + response,
+            });
+          });
+        }
+      }
+
+      it("queued response: strictContentLength with the Content-Length of setHeader(), end() throws", async () => {
+        const { socket, result } = await exchange(transport, {
+          queued: true,
+          listener: res => {
+            res.strictContentLength = true;
+            res.setHeader("Content-Length", "1");
+            return caught(() => res.end("ok"));
+          },
+          // Node keeps this response open after the throw.
+          until: wire => wire.includes("\r\n\r\nfirst"),
+        });
+        expect({ socket, result }).toEqual({ socket: "none", result: lengthMismatch(2, 1) });
+      });
+
+      it("queued response: the bytes written so far are counted when it has the connection", async () => {
+        expect(
+          await exchange(transport, {
+            queued: true,
+            listener: res => {
+              const result: { threw?: unknown } = {};
+              res.strictContentLength = true;
+              res.writeHead(200, { "Content-Length": "4" });
+              res.write("ok");
+              res.on("socket", () => {
+                result.threw = caught(() => res.end("okk"));
+                res.end("ok");
+              });
+              return result;
+            },
+          }),
+        ).toEqual({
+          socket: "none",
+          result: { threw: lengthMismatch(5, 4) },
+          wire: firstResponse + "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nokok",
+        });
+      });
+
+      it("queued response: a write() from a 'socket' listener goes out behind the earlier ones", async () => {
+        expect(
+          await exchange(transport, {
+            queued: true,
+            listener: res => {
+              const seen: { socket?: boolean } = {};
+              res.write("ab");
+              res.on("socket", socket => {
+                seen.socket = res.socket === socket;
+                res.write("cd");
+                res.end("e");
+              });
+              return seen;
+            },
+          }),
+        ).toEqual({
+          socket: "none",
+          result: { socket: true },
+          wire:
+            firstResponse +
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n2\r\ncd\r\n1\r\ne\r\n0\r\n\r\n",
+        });
+      });
+
+      it("queued response: a 1xx response goes out ahead of the head", async () => {
+        expect(
+          await exchange(transport, {
+            queued: true,
+            listener: res => {
+              res.writeProcessing();
+              res.end("x");
+            },
+          }),
+        ).toEqual({
+          socket: "none",
+          result: undefined,
+          wire:
+            firstResponse +
+            "HTTP/1.1 102 Processing\r\n\r\n" +
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\nx",
+        });
+      });
+
+      it("queued response: flushHeaders() sends the whole head when the response has the connection", async () => {
+        expect(
+          await exchange(transport, {
+            queued: true,
+            listener: res => {
+              res.flushHeaders();
+            },
+            // The response stays open. The empty line ends its head.
+            until: wire => wire.includes("\r\n\r\nfirstHTTP/1.1 ") && wire.endsWith("\r\n\r\n"),
+          }),
+        ).toEqual({
+          socket: "none",
+          result: undefined,
+          wire: firstResponse + "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+        });
+      });
+
+      it("queued response: the trailers follow the body", async () => {
+        expect(
+          await exchange(transport, {
+            queued: true,
+            listener: res => {
+              res.setHeader("Trailer", "x-checksum");
+              res.addTrailers({ "x-checksum": "abc" });
+              res.write("a");
+              res.end();
+            },
+          }),
+        ).toEqual({
+          socket: "none",
+          result: undefined,
+          wire:
+            firstResponse +
+            "HTTP/1.1 200 OK\r\nTrailer: x-checksum\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n" +
+            "1\r\na\r\n0\r\nx-checksum: abc\r\n\r\n",
+        });
+      });
+
+      it("queued response: the response ahead gets its 'finish' listeners and its end() callback", async () => {
+        const events: string[] = [];
+        expect(
+          await exchange(transport, {
+            queued: true,
+            listener: res => {
+              const threw = caught(() => res.write(123 as any));
+              res.end("E");
+              return threw?.code;
+            },
+            endFirst: first => {
+              first.on("finish", () => events.push("finish"));
+              first.end("first", () => events.push("end callback"));
+            },
+          }),
+        ).toEqual({
+          socket: "none",
+          result: "ERR_INVALID_ARG_TYPE",
+          wire: firstResponse + "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\nE",
+        });
+        expect(events).toEqual(["finish", "end callback"]);
+      });
+
+      it("queued response: end() from a 'socket' listener finishes it behind a write that is still buffered", async () => {
+        // More than the socket takes at once: a part of it is still buffered when the 'socket' listener runs.
+        const body = Buffer.alloc(8 * 1024 * 1024, "x").toString();
+        const head = `HTTP/1.1 200 OK\r\nContent-Length: ${body.length + 1}\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\r\n`;
+        const events: string[] = [];
+        const ended = Promise.withResolvers<void>();
+        const { socket, wire } = await exchange(transport, {
+          queued: true,
+          keepAlive: true,
+          listener: res => {
+            res.setHeader("Content-Length", String(body.length + 1));
+            res.write(body, () => events.push("write callback"));
+            res.on("finish", () => events.push("finish"));
+            res.on("socket", () =>
+              res.end("e", () => {
+                events.push("end callback");
+                ended.resolve();
+              }),
+            );
+          },
+          until: wire => wire.endsWith("xe"),
+          stop: ended.promise,
+        });
+        expect({
+          socket,
+          events,
+          length: wire.length,
+          start: wire.slice(0, firstResponse.length + head.length + 1),
+          end: wire.slice(-2),
+        }).toEqual({
+          socket: "none",
+          events: ["write callback", "finish", "end callback"],
+          length: firstResponse.length + head.length + body.length + 1,
+          start: firstResponse + head + "x",
+          end: "xe",
+        });
+      });
+
+      it("queued response: nothing of it goes out when a 'socket' listener destroys it", async () => {
+        const events: string[] = [];
+        const closed = Promise.withResolvers<void>();
+        expect(
+          await exchange(transport, {
+            queued: true,
+            listener: res => {
+              res.on("socket", () => res.destroy());
+              res.on("finish", () => events.push("finish"));
+              res.on("close", () => closed.resolve());
+              res.write("a");
+              res.end("b");
+            },
+            // The client side of a duplexPair() does not see the destroy of the server side.
+            ...(transport === "duplex"
+              ? { until: (wire: string) => wire.includes("\r\n\r\nfirst"), stop: closed.promise }
+              : {}),
+          }),
+        ).toEqual({ socket: "none", result: undefined, wire: firstResponse });
+        await closed.promise;
+        expect(events).toEqual([]);
+      });
+    });
+  }
+
+  // A typed array of more than 1000 elements has no ArrayBuffer of its own until JS reads its
+  // `buffer`. The record of a queued response cannot pin that storage, so it holds a copy: user
+  // code that transfers the buffer away frees the bytes it would otherwise point at.
+  it.concurrent("a queued response keeps the bytes of a chunk whose buffer is transferred away", async () => {
+    const size = 4096;
+    using dir = tempDir("http-queued-transfer", {
+      "server.js": [
+        'const http = require("node:http");',
+        'const net = require("node:net");',
+        `const size = ${size};`,
+        "let first;",
+        "const server = http.createServer((req, res) => {",
+        '  if (req.url === "/first") return void (first = res);',
+        "  const chunk = new Uint8Array(size).fill(0x61);",
+        '  res.setHeader("Content-Length", String(size));',
+        "  res.write(chunk);",
+        "  // Materializes the ArrayBuffer of the view, then frees that storage.",
+        "  chunk.buffer.transfer(8);",
+        "  // Reuse the freed bytes.",
+        "  const junk = [];",
+        '  for (let i = 0; i < 64; i++) junk.push(Buffer.alloc(size, "b"));',
+        "  res.end();",
+        '  first.end("first");',
+        "});",
+        'server.listen(0, "127.0.0.1", () => {',
+        '  const client = net.connect(server.address().port, "127.0.0.1");',
+        '  let wire = "";',
+        '  client.on("data", chunk => (wire += chunk.toString("latin1")));',
+        '  client.on("close", () => {',
+        '    const body = wire.slice(wire.lastIndexOf("\\r\\n\\r\\n") + 4);',
+        "    console.log(JSON.stringify({ length: body.length, onlyA: /^a*$/.test(body) }));",
+        "    server.close();",
+        "  });",
+        "  client.write(",
+        '    "GET /first HTTP/1.1\\r\\nHost: x\\r\\n\\r\\nGET /second HTTP/1.1\\r\\nHost: x\\r\\nConnection: close\\r\\n\\r\\n",',
+        "  );",
+        "});",
+      ].join("\n"),
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "server.js"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ result: stdout ? JSON.parse(stdout) : undefined, stderr, exitCode }).toEqual({
+      result: { length: size, onlyA: true },
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // The bytes of a buffer chunk are borrowed from the conversion of the chunk to the write. The
+  // toString() of a statusMessage that is not a string runs JS, so it has to run before that.
+  describe.concurrent.each([
+    ["end", "current"],
+    ["end", "queued"],
+    ["write", "current"],
+  ])("a statusMessage whose toString() resizes the buffer of the chunk: %s(), %s response", (method, kind) => {
+    const script = `
+      const http = require("node:http");
+      const net = require("node:net");
+      const [method, kind] = process.argv.slice(1);
+      let first;
+      const server = http.createServer((req, res) => {
+        if (req.url === "/first") return void (first = res);
+        const buffer = new ArrayBuffer(4096, { maxByteLength: 4096 });
+        const chunk = new Uint8Array(buffer).fill(0x61);
+        res.statusMessage = {
+          toString() {
+            buffer.resize(0);
+            return "OK";
+          },
+        };
+        if (method === "end") res.end(chunk);
+        else {
+          res.write(chunk);
+          res.end();
+        }
+        first?.end("first");
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const client = net.connect(server.address().port, "127.0.0.1");
+        let wire = "";
+        client.on("data", chunk => (wire += chunk.toString("latin1")));
+        client.on("close", () => {
+          console.log(JSON.stringify(wire.replace(/Date: [^\\r]+\\r\\n/g, "")));
+          server.close();
+        });
+        client.write(
+          (kind === "queued" ? "GET /first HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n" : "") +
+            "GET /second HTTP/1.1\\r\\nHost: x\\r\\nConnection: close\\r\\n\\r\\n",
+        );
+      });
+    `;
+    it("sends a response with no body", async () => {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "-e", script, method, kind],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({
+        wire: stdout ? JSON.parse(stdout) : undefined,
+        stderr,
+        exitCode,
+        signalCode: proc.signalCode,
+      }).toEqual({
+        wire:
+          (kind === "queued" ? firstResponse : "") +
+          "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        stderr: "",
+        exitCode: 0,
+        signalCode: null,
+      });
+    });
+  });
+});
 
 it("requireHostHeader still rejects Upgrade-carrying requests that dispatch as normal requests", async () => {
   // The native parser exempts Upgrade requests from the Host check so genuine
