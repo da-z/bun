@@ -508,6 +508,91 @@ it("reading a request body does not reopen the read gate that queued pipelined r
   }
 });
 
+// The end of the response that has the connection opens the reads of the connection again. A
+// response that waits behind it has no connection yet, so its end() must leave the reads alone.
+describe("end() of a response that waits behind another one", () => {
+  const ends: [string, (res: ServerResponse) => void][] = [
+    ["end(chunk)", res => void res.end("two")],
+    [
+      "write(chunk) and end(chunk)",
+      res => {
+        res.write("t");
+        res.end("wo");
+      },
+    ],
+    [
+      "end(chunk) with trailers",
+      res => {
+        res.setHeader("Trailer", "x-t");
+        res.addTrailers({ "x-t": "1" });
+        res.end("two");
+      },
+    ],
+    [
+      "write(chunk) and end(chunk) with trailers",
+      res => {
+        res.setHeader("Trailer", "x-t");
+        res.write("t");
+        res.addTrailers({ "x-t": "1" });
+        res.end("wo");
+      },
+    ],
+  ];
+
+  it.each(ends)("%s leaves the reads that the reader of a later request stopped", async (_, end) => {
+    // The first response has the connection. The second waits behind it. The third request
+    // uploads a body, and its reader stops after the first chunk.
+    const upload = 4 * 1024 * 1024;
+    const { promise: stopped, resolve: onStopped } = Promise.withResolvers<IncomingMessage>();
+    let second!: ServerResponse;
+    const server = createServer((req, res) => {
+      if (req.url === "/ping") return void res.end("pong");
+      if (req.url === "/1") return;
+      if (req.url === "/2") return void (second = res);
+      req.once("data", () => {
+        req.pause();
+        onStopped(req);
+      });
+    });
+    await once(server.listen(0, "127.0.0.1"), "listening");
+    const port = (server.address() as AddressInfo).port;
+    // A round trip on another connection: the server has polled the first one in between.
+    async function ping() {
+      const socket = connect(port, "127.0.0.1");
+      socket.write("GET /ping HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+      socket.resume();
+      await once(socket, "close");
+    }
+    const client = connect(port, "127.0.0.1");
+    client.on("error", () => {});
+    try {
+      client.write(
+        "GET /1 HTTP/1.1\r\nHost: a\r\n\r\nGET /2 HTTP/1.1\r\nHost: a\r\n\r\n" +
+          `POST /3 HTTP/1.1\r\nHost: a\r\nContent-Length: ${upload}\r\n\r\n`,
+      );
+      client.write(Buffer.alloc(upload, "z"));
+      const third = await stopped;
+      // The connection stops reading once the buffer of the request is full.
+      let buffered = -1;
+      while (buffered !== third.readableLength) {
+        buffered = third.readableLength;
+        await ping();
+      }
+      expect(buffered).toBeLessThan(upload);
+      expect(second.socket).toBeNull();
+
+      end(second);
+      await ping();
+      await ping();
+      expect({ queued: second.socket === null, buffered: third.readableLength }).toEqual({ queued: true, buffered });
+    } finally {
+      client.destroy();
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+});
+
 describe("upgrade request whose whole body arrived with its head", () => {
   const upgradeHeaders = "Upgrade: test\r\nConnection: Upgrade\r\n";
   const switchingProtocols = `HTTP/1.1 101 Switching Protocols\r\n${upgradeHeaders}\r\n`;
