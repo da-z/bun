@@ -3,11 +3,18 @@ import { spawn } from "bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import crypto from "crypto";
 import { EventEmitter, once } from "events";
-import { bunEnv, bunExe, isDebug } from "harness";
+import { bunEnv, bunExe, isDebug, tls } from "harness";
 import { createServer, request } from "http";
-import { AddressInfo, connect } from "net";
+import { createServer as createSecureServer } from "https";
+import { AddressInfo, connect, createServer as createNetServer, Socket } from "net";
 import path from "node:path";
+import { connect as connectTLS, createServer as createTLSServer } from "tls";
 import { Server, WebSocket, WebSocketServer } from "ws";
+import NpmWebSocketServerModule from "../../../node_modules/ws/lib/websocket-server.js";
+import NpmWebSocketModule from "../../../node_modules/ws/lib/websocket.js";
+
+const NpmWebSocket: typeof WebSocket = NpmWebSocketModule;
+const NpmWebSocketServer: typeof WebSocketServer = NpmWebSocketServerModule;
 
 const strings = [
   {
@@ -1074,6 +1081,648 @@ it("Server should be able to send empty pings", async () => {
     await checkPing("Hello, World", pingPayload).catch(e => (err = e));
     expect(err).toBeInstanceOf(RangeError);
     expect((err as Error).message).toContain("must not be greater than 125 bytes");
+  }
+});
+
+// What send(data, options) puts on the wire, read by a peer that has no websocket implementation. The rule of npm ws:
+//   if (typeof data === "number") data = data.toString();
+//   opcode = { binary: typeof data !== "string", ...options }.binary ? 2 : 1
+//   payload = the bytes of `data || EMPTY_BUFFER` as they are, with Buffer.from(data) for a value that has none
+// https://github.com/websockets/ws/blob/8.18.3/lib/websocket.js#L448-L478
+// https://github.com/websockets/ws/blob/8.18.3/lib/sender.js#L346-L363
+// https://github.com/websockets/ws/blob/8.18.3/lib/buffer-util.js#L87-L105
+// The "npm" half runs the package itself, so each table below is the output of npm ws and not a reading of its source.
+describe.each([
+  { implementation: "built-in", WebSocket, WebSocketServer },
+  { implementation: "npm", WebSocket: NpmWebSocket, WebSocketServer: NpmWebSocketServer },
+])("send(data, options) of the $implementation ws", ({ implementation, WebSocket, WebSocketServer }) => {
+  type WireFrame = { fin: boolean; opcode: number; payload: string };
+  const TEXT = 1;
+  const BINARY = 2;
+  const END = Buffer.from("END").toString("hex");
+
+  // Hands each frame of a byte stream to `onFrame`, with the payload as hex. Of a frame of more than 64 KiB it
+  // keeps the first byte and the count of the others: "41+4194303" is 4 MiB that start with 0x41.
+  function frameReader(onFrame: (frame: WireFrame) => void) {
+    let pending: Buffer = Buffer.alloc(0);
+    let skip = 0;
+    return (chunk: Buffer) => {
+      if (skip > 0) {
+        const skipped = Math.min(skip, chunk.length);
+        skip -= skipped;
+        if (skipped === chunk.length) return;
+        chunk = chunk.subarray(skipped);
+      }
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      while (pending.length >= 2) {
+        const masked = (pending[1] & 0x80) !== 0;
+        let length = pending[1] & 0x7f;
+        let offset = 2;
+        if (length === 126) {
+          if (pending.length < 4) return;
+          length = pending.readUInt16BE(2);
+          offset = 4;
+        } else if (length === 127) {
+          if (pending.length < 10) return;
+          length = Number(pending.readBigUInt64BE(2));
+          offset = 10;
+        }
+        const key = masked ? pending.subarray(offset, offset + 4) : undefined;
+        if (masked) offset += 4;
+        const large = length > 64 * 1024;
+        if (pending.length < offset + (large ? 1 : length)) return;
+        const payload = Buffer.from(pending.subarray(offset, offset + (large ? 1 : length)));
+        if (key) for (let i = 0; i < payload.length; i++) payload[i] ^= key[i & 3];
+        const frame = { fin: (pending[0] & 0x80) !== 0, opcode: pending[0] & 0x0f };
+        if (large) {
+          onFrame({ ...frame, payload: `${payload.toString("hex")}+${length - 1}` });
+          skip = Math.max(0, offset + length - pending.length);
+          pending = pending.subarray(Math.min(pending.length, offset + length));
+        } else {
+          onFrame({ ...frame, payload: payload.toString("hex") });
+          pending = pending.subarray(offset + length);
+        }
+      }
+    };
+  }
+
+  // The peer side of a raw socket: it reads the HTTP head, hands it to `onHead`, then reads frames.
+  function readAfterHead(
+    socket: Socket,
+    onHead: (head: string) => void,
+    onFrame: (frame: WireFrame) => void,
+    onError: (error: Error) => void,
+  ) {
+    const read = frameReader(onFrame);
+    let head: Buffer | null = Buffer.alloc(0);
+    socket.on("error", onError);
+    socket.on("data", (chunk: Buffer) => {
+      if (head === null) return read(chunk);
+      head = Buffer.concat([head, chunk]);
+      const end = head.indexOf("\r\n\r\n");
+      if (end === -1) return;
+      const rest = head.subarray(end + 4);
+      onHead(head.subarray(0, end).toString("latin1"));
+      head = null;
+      if (rest.length) read(rest);
+    });
+  }
+
+  // A TCP or TLS client with no websocket implementation. It asks for the upgrade, and `upgraded` resolves when
+  // the answer of the server arrived.
+  function rawClient(
+    port: number,
+    secure: boolean,
+    onFrame: (frame: WireFrame) => void,
+    onError: (error: Error) => void,
+  ) {
+    const upgraded = Promise.withResolvers<void>();
+    const request =
+      "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    const peer: Socket = secure
+      ? connectTLS({ port, host: "127.0.0.1", rejectUnauthorized: false }, () => peer.write(request))
+      : connect(port, "127.0.0.1", () => peer.write(request));
+    readAfterHead(peer, () => upgraded.resolve(), onFrame, onError);
+    return { peer, upgraded: upgraded.promise };
+  }
+
+  // Opens a socket of this implementation, on the `side` under test, to a peer with no websocket implementation.
+  // The peer gives every frame it gets to `onFrame`.
+  async function openToRawPeer(side: "server" | "client", secure: boolean, onFrame: (frame: WireFrame) => void) {
+    const failure = Promise.withResolvers<never>();
+    failure.promise.catch(() => {});
+
+    if (side === "server") {
+      const server = secure ? createSecureServer({ ...tls }) : createServer();
+      const wss = new WebSocketServer({ server });
+      const connection = Promise.withResolvers<WebSocket>();
+      wss.on("error", failure.reject);
+      wss.on("connection", ws => {
+        ws.on("error", failure.reject);
+        connection.resolve(ws);
+      });
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      const { peer, upgraded } = rawClient((server.address() as AddressInfo).port, secure, onFrame, failure.reject);
+      const ws = await Promise.race([connection.promise, failure.promise]);
+      await Promise.race([upgraded, failure.promise]);
+      return {
+        ws,
+        peer,
+        failure: failure.promise,
+        close() {
+          ws.terminate();
+          peer.destroy();
+          wss.close();
+          server.close();
+        },
+      };
+    }
+
+    const server = secure ? createTLSServer({ ...tls }) : createNetServer();
+    const accepted = Promise.withResolvers<Socket>();
+    server.on("error", failure.reject);
+    server.on(secure ? "secureConnection" : "connection", (socket: Socket) => {
+      const accept = (head: string) => {
+        const key = /^sec-websocket-key:\s*(\S+)/im.exec(head)![1];
+        const digest = crypto
+          .createHash("sha1")
+          .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+          .digest("base64");
+        socket.write(
+          "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+            `Sec-WebSocket-Accept: ${digest}\r\n\r\n`,
+        );
+      };
+      readAfterHead(socket, accept, onFrame, failure.reject);
+      accepted.resolve(socket);
+    });
+    await once(server.listen(0, "127.0.0.1"), "listening");
+    const { port } = server.address() as AddressInfo;
+    // Trusts the self-signed certificate: `rejectUnauthorized` is the option of npm ws, `tls` the one of the built-in.
+    const trust: object = { rejectUnauthorized: false, tls: { rejectUnauthorized: false } };
+    const ws = new WebSocket(`${secure ? "wss" : "ws"}://127.0.0.1:${port}`, trust);
+    const opened = Promise.withResolvers<void>();
+    ws.on("error", failure.reject);
+    ws.on("open", () => opened.resolve());
+    await Promise.race([opened.promise, failure.promise]);
+    const peer = await accepted.promise;
+    return {
+      ws,
+      peer,
+      failure: failure.promise,
+      close() {
+        ws.terminate();
+        peer.destroy();
+        server.close();
+      },
+    };
+  }
+
+  const text = "text-\u4e16-\u{1f636}";
+  const utf8 = Buffer.from(text);
+  const hex = utf8.toString("hex");
+  const padded = Buffer.concat([Buffer.from([0xff, 0xff]), utf8, Buffer.from([0xff])]);
+  const bytes = () => Buffer.from(utf8);
+  const arrayBuffer = () => new Uint8Array(utf8).buffer;
+  const dataView = () => new DataView(new Uint8Array(padded).buffer, 2, utf8.length);
+  const blob = () => new Blob([utf8]);
+  const shared = () => {
+    const buffer = new SharedArrayBuffer(utf8.length);
+    new Uint8Array(buffer).set(utf8);
+    return buffer;
+  };
+  const resizable = () => {
+    const buffer = new ArrayBuffer(utf8.length, { maxByteLength: 64 });
+    new Uint8Array(buffer).set(utf8);
+    return buffer;
+  };
+  const hidden = (binary: unknown) => Object.defineProperty({}, "binary", { value: binary, enumerable: false });
+
+  type Row = [label: string, data: () => unknown, options: object | undefined, opcode: number, payload: string];
+
+  // A string, bytes or a Blob: `binary` selects the frame type, and the payload is not converted.
+  const payloads: Row[] = [
+    // a falsy own `binary`: a text frame with the same bytes
+    ["Buffer", bytes, { binary: false }, TEXT, hex],
+    ["Uint8Array", () => new Uint8Array(utf8), { binary: false }, TEXT, hex],
+    [
+      "Uint8Array with an offset",
+      () => new Uint8Array(padded.buffer, padded.byteOffset + 2, utf8.length),
+      { binary: false },
+      TEXT,
+      hex,
+    ],
+    [
+      "Uint16Array",
+      () => new Uint16Array(new Uint8Array([0x68, 0x69, 0x6a, 0x6b]).buffer),
+      { binary: false },
+      TEXT,
+      "68696a6b",
+    ],
+    ["DataView with an offset", dataView, { binary: false }, TEXT, hex],
+    ["ArrayBuffer", arrayBuffer, { binary: false }, TEXT, hex],
+    ["SharedArrayBuffer", shared, { binary: false }, TEXT, hex],
+    ["resizable ArrayBuffer", resizable, { binary: false }, TEXT, hex],
+    ["Blob", blob, { binary: false }, TEXT, hex],
+    ["empty Buffer", () => Buffer.alloc(0), { binary: false }, TEXT, ""],
+    ["empty ArrayBuffer", () => new ArrayBuffer(0), { binary: false }, TEXT, ""],
+    ["empty Blob", () => new Blob([]), { binary: false }, TEXT, ""],
+    // npm ws does not validate what it sends. Bytes that are not UTF-8 go into the text frame as they are, and a
+    // peer that validates text frames then fails the connection.
+    ["Buffer that is not UTF-8", () => Buffer.from([0xff, 0x68]), { binary: false }, TEXT, "ff68"],
+    ["Float64Array that is not UTF-8", () => new Float64Array([1]), { binary: false }, TEXT, "000000000000f03f"],
+    ["Buffer that ends inside a character", () => utf8.subarray(0, 6), { binary: false }, TEXT, hex.slice(0, 12)],
+    // a truthy own `binary`: a binary frame
+    ["string", () => text, { binary: true }, BINARY, hex],
+    ["empty string", () => "", { binary: true }, BINARY, ""],
+    ["number", () => 12, { binary: true }, BINARY, "3132"],
+    ["Buffer", bytes, { binary: true }, BINARY, hex],
+    ["DataView with an offset", dataView, { binary: true }, BINARY, hex],
+    ["ArrayBuffer", arrayBuffer, { binary: true }, BINARY, hex],
+    ["SharedArrayBuffer", shared, { binary: true }, BINARY, hex],
+    ["Blob", blob, { binary: true }, BINARY, hex],
+    ["string", () => text, { binary: false }, TEXT, hex],
+    ["number", () => 12, { binary: false }, TEXT, "3132"],
+    // only the truth of `binary` counts
+    ["Buffer", bytes, { binary: 0 }, TEXT, hex],
+    ["Buffer", bytes, { binary: null }, TEXT, hex],
+    ["Buffer", bytes, { binary: "" }, TEXT, hex],
+    ["Buffer", bytes, { binary: NaN }, TEXT, hex],
+    ["Buffer", bytes, { binary: undefined }, TEXT, hex],
+    ["Buffer", bytes, { binary: 1 }, BINARY, hex],
+    ["string", () => text, { binary: 1 }, BINARY, hex],
+    ["string", () => text, { binary: "yes" }, BINARY, hex],
+    ["string", () => text, { binary: {} }, BINARY, hex],
+    ["string", () => text, { binary: undefined }, TEXT, hex],
+    // `{ ...options }` copies own properties only
+    ["Buffer, inherited false", bytes, Object.create({ binary: false }), BINARY, hex],
+    ["Buffer, inherited undefined", bytes, Object.create({ binary: undefined }), BINARY, hex],
+    ["string, inherited true", () => text, Object.create({ binary: true }), TEXT, hex],
+    ["Buffer, not enumerable undefined", bytes, hidden(undefined), BINARY, hex],
+    [
+      "Buffer, own false over inherited true",
+      bytes,
+      Object.assign(Object.create({ binary: true }), { binary: false }),
+      TEXT,
+      hex,
+    ],
+    // `binary` beside other options
+    ["Buffer", bytes, { compress: false, binary: false, fin: true }, TEXT, hex],
+    ["string", () => text, { compress: false, binary: true }, BINARY, hex],
+    // no `binary`: the type of the data selects the frame type
+    ["string", () => text, undefined, TEXT, hex],
+    ["empty string", () => "", undefined, TEXT, ""],
+    ["number", () => 12, undefined, TEXT, "3132"],
+    ["number", () => 0, undefined, TEXT, "30"],
+    ["Buffer", bytes, undefined, BINARY, hex],
+    ["empty Buffer", () => Buffer.alloc(0), undefined, BINARY, ""],
+    ["DataView with an offset", dataView, undefined, BINARY, hex],
+    ["ArrayBuffer", arrayBuffer, undefined, BINARY, hex],
+    ["Blob", blob, undefined, BINARY, hex],
+    ["Buffer", bytes, {}, BINARY, hex],
+    ["Buffer", bytes, { compress: false }, BINARY, hex],
+    ["string", () => text, { compress: false }, TEXT, hex],
+  ];
+
+  // Any other value: nothing for a falsy one, Buffer.from(data) for the rest. `binary` selects the frame type as above.
+  const otherValues: Row[] = [
+    ["null", () => null, undefined, BINARY, ""],
+    ["undefined", () => undefined, undefined, BINARY, ""],
+    ["false", () => false, undefined, BINARY, ""],
+    ["0n", () => 0n, undefined, BINARY, ""],
+    ["null", () => null, { binary: false }, TEXT, ""],
+    ["undefined", () => undefined, { binary: true }, BINARY, ""],
+    ["array", () => [104, 105], undefined, BINARY, "6869"],
+    ["array", () => [104, 105], { binary: false }, TEXT, "6869"],
+    ["array-like object", () => ({ length: 2, 0: 104, 1: 105 }), undefined, BINARY, "6869"],
+    ["String object", () => new String("hi"), undefined, BINARY, "6869"],
+    ["object with valueOf()", () => ({ valueOf: () => "hi" }), undefined, BINARY, "6869"],
+  ];
+
+  function describeOptions(options: object | undefined) {
+    if (options === undefined) return "no options";
+    const own = Object.entries(options).map(([key, value]) => `${key}: ${Bun.inspect(value)}`);
+    return own.length ? `{ ${own.join(", ")} }` : "{}";
+  }
+
+  const onTheWire = (rows: Row[]) =>
+    rows.map(([label, , options, opcode, payload]) => ({
+      row: `${label}, ${describeOptions(options)}`,
+      fin: true,
+      opcode,
+      payload,
+    }));
+
+  // Sends every row. Resolves with the frames the peer got, and with the count of send() callbacks that had run
+  // when the last frame arrived: a frame reaches the peer after its socket wrote it.
+  async function sendRows(side: "server" | "client", secure: boolean, rows: Row[]) {
+    const frames: WireFrame[] = [];
+    const all = Promise.withResolvers<number>();
+    let callbacks = 0;
+    const connection = await openToRawPeer(side, secure, frame => {
+      if (frames.push(frame) === rows.length) all.resolve(callbacks);
+    });
+    try {
+      const callback = (error?: Error | null) => {
+        if (error) all.reject(error);
+        else callbacks++;
+      };
+      for (const [, data, options] of rows) {
+        // A send() with no options is a call with two arguments, as a program makes it.
+        if (options === undefined) connection.ws.send(data() as Buffer, callback);
+        else connection.ws.send(data() as Buffer, options, callback);
+      }
+      const callbacksRun = await Promise.race([all.promise, connection.failure]);
+      const expected = onTheWire(rows);
+      return { frames: frames.map((frame, i) => ({ row: expected[i].row, ...frame })), callbacksRun };
+    } finally {
+      connection.close();
+    }
+  }
+
+  describe.each([
+    { side: "server", transport: "TCP" },
+    { side: "server", transport: "TLS" },
+    { side: "client", transport: "TCP" },
+    { side: "client", transport: "TLS" },
+  ] as const)("a $side socket over $transport", ({ side, transport }) => {
+    const secure = transport === "TLS";
+
+    it("sends a string, bytes and a Blob as they are, with the frame type that `binary` selects", async () => {
+      expect(await sendRows(side, secure, payloads)).toEqual({
+        frames: onTheWire(payloads),
+        callbacksRun: payloads.length,
+      });
+    });
+
+    it("sends nothing for a falsy value and Buffer.from(data) for any other value", async () => {
+      expect(await sendRows(side, secure, otherValues)).toEqual({
+        frames: onTheWire(otherValues),
+        callbacksRun: otherValues.length,
+      });
+    });
+
+    it("throws for a value that Buffer.from() rejects, and sends nothing for it", async () => {
+      const frames: WireFrame[] = [];
+      const end = Promise.withResolvers<void>();
+      let callbacks = 0;
+      const connection = await openToRawPeer(side, secure, frame => {
+        frames.push(frame);
+        if (frame.payload === END) end.resolve();
+      });
+      try {
+        const thrown = [true, { a: 1 }, 10n, Symbol("s"), () => {}].map(value => {
+          try {
+            connection.ws.send(value as unknown as Buffer, () => void callbacks++);
+            return "no error";
+          } catch (error) {
+            return { name: (error as Error).name, code: (error as NodeJS.ErrnoException).code };
+          }
+        });
+        connection.ws.send("END");
+        await Promise.race([end.promise, connection.failure]);
+        expect({ thrown, callbacks, frames }).toEqual({
+          thrown: Array(5).fill({ name: "TypeError", code: "ERR_INVALID_ARG_TYPE" }),
+          callbacks: 0,
+          frames: [{ fin: true, opcode: TEXT, payload: END }],
+        });
+      } finally {
+        connection.close();
+      }
+    });
+  });
+
+  // The broadcast of the npm ws README: `client.send(data, { binary: isBinary })` with the data of 'message'.
+  it.each(["nodebuffer", "arraybuffer", "blob"] as const)(
+    "a server socket with binaryType %s echoes a text frame as a text frame",
+    async binaryType => {
+      const frames: WireFrame[] = [];
+      const all = Promise.withResolvers<void>();
+      const connection = await openToRawPeer("server", false, frame => {
+        if (frames.push(frame) === 2) all.resolve();
+      });
+      try {
+        // @types/ws 8.5 does not list "blob", ws 8.18 accepts it
+        connection.ws.binaryType = binaryType as WebSocket["binaryType"];
+        connection.ws.on("message", (data, isBinary) => connection.ws.send(data, { binary: isBinary }));
+        // two frames of a client, with a masking key of zeros: the text "hi", then the bytes 01 02 03
+        connection.peer.write(Buffer.from([0x81, 0x82, 0, 0, 0, 0, 0x68, 0x69]));
+        connection.peer.write(Buffer.from([0x82, 0x83, 0, 0, 0, 0, 1, 2, 3]));
+        await Promise.race([all.promise, connection.failure]);
+        expect(frames).toEqual([
+          { fin: true, opcode: TEXT, payload: "6869" },
+          { fin: true, opcode: BINARY, payload: "010203" },
+        ]);
+      } finally {
+        connection.close();
+      }
+    },
+  );
+
+  // A peer that does not read makes the server socket keep what it cannot write. Each message must reach the
+  // peer one time, in the order of the calls, with the frame type that send() selected.
+  it("a server socket sends a message that had to wait one time, in order, with its frame type", async () => {
+    const size = 4 * 1024 * 1024;
+    const frames: WireFrame[] = [];
+    const seen = new Set<string>();
+    const done = Promise.withResolvers<number>();
+    let callbacks = 0;
+    const connection = await openToRawPeer("server", false, frame => {
+      frames.push(frame);
+      // The end mark, or a second copy of a message, ends the test.
+      if (frame.payload === END || seen.has(frame.payload)) done.resolve(callbacks);
+      seen.add(frame.payload);
+    });
+    try {
+      const { ws, peer } = connection;
+      peer.pause();
+      const expected: WireFrame[] = [];
+      let sent = 0;
+      const callback = (error?: Error | null) => {
+        if (error) done.reject(error);
+        else callbacks++;
+      };
+      const send = () => {
+        const tag = 0x41 + sent++;
+        // bytes as a text frame and a string as a binary frame, in turn
+        if (sent % 2) ws.send(Buffer.alloc(size, tag), { binary: false }, callback);
+        else ws.send(Buffer.alloc(size, tag).toString(), { binary: true }, callback);
+        expected.push({ fin: true, opcode: sent % 2 ? TEXT : BINARY, payload: `${tag.toString(16)}+${size - 1}` });
+      };
+      // The callback of a message that the socket wrote or buffered runs before the next macrotask. The first
+      // message whose callback does not run is one that waits for the peer. Where the kernel takes all 8, none waits.
+      do {
+        send();
+        await new Promise(resolve => setImmediate(resolve));
+      } while (callbacks === sent && sent < 8);
+      // Behind it: two more messages, then values that are not a string, bytes or a Blob, then the end mark.
+      send();
+      send();
+      ws.send(null as unknown as Buffer, callback);
+      expected.push({ fin: true, opcode: BINARY, payload: "" });
+      expect(() => ws.send(true as unknown as Buffer, callback)).toThrow(
+        expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }),
+      );
+      ws.send([104, 105] as unknown as Buffer, { binary: false }, callback);
+      expected.push({ fin: true, opcode: TEXT, payload: "6869" });
+      ws.send("END", callback);
+      expected.push({ fin: true, opcode: TEXT, payload: END });
+
+      peer.resume();
+      const callbacksRun = await Promise.race([done.promise, connection.failure]);
+      expect({ frames, callbacksRun, bufferedAmount: ws.bufferedAmount }).toEqual({
+        frames: expected,
+        callbacksRun: sent + 3,
+        bufferedAmount: 0,
+      });
+    } finally {
+      connection.close();
+    }
+  });
+
+  // What a closing or closed client socket gets is not sent. It counts in bufferedAmount, in the built-in socket
+  // with the 6 bytes of a frame head and its mask.
+  it("a client socket that is not open sends nothing and counts what send() gets", async () => {
+    const frames: WireFrame[] = [];
+    const connection = await openToRawPeer("client", false, frame => frames.push(frame));
+    try {
+      const { ws, peer } = connection;
+      const rows: [label: string, data: () => unknown, options: object | undefined][] = [
+        ["string", () => "four", undefined],
+        ["string, { binary: true }", () => "four", { binary: true }],
+        ["Buffer", () => Buffer.from("four"), undefined],
+        ["Buffer, { binary: false }", () => Buffer.from("four"), { binary: false }],
+        ["ArrayBuffer", () => new ArrayBuffer(4), undefined],
+        ["DataView", () => new DataView(new ArrayBuffer(4)), undefined],
+        ["Blob", () => new Blob(["four"]), undefined],
+      ];
+      const counted = () =>
+        rows.map(([label, data, options]) => {
+          const before = ws.bufferedAmount;
+          if (options === undefined) ws.send(data() as Buffer);
+          else ws.send(data() as Buffer, options);
+          return [label, ws.bufferedAmount - before];
+        });
+      ws.close();
+      const closing = { readyState: ws.readyState, counted: counted() };
+      peer.destroy();
+      await once(ws, "close");
+      const closed = { readyState: ws.readyState, counted: counted() };
+
+      const each = rows.map(([label]) => [label, implementation === "built-in" ? 10 : 4]);
+      expect({ closing, closed, data: frames.filter(frame => frame.opcode !== 8) }).toEqual({
+        closing: { readyState: 2, counted: each },
+        closed: { readyState: 3, counted: each },
+        data: [],
+      });
+    } finally {
+      connection.close();
+    }
+  });
+
+  // npm ws throws the error. The built-in socket gives it to the callback.
+  it("a client socket that is not open yet reports an error for send()", async () => {
+    const server = createNetServer().listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const ws = new WebSocket("ws://127.0.0.1:" + (server.address() as AddressInfo).port);
+    ws.on("error", () => {});
+    try {
+      const errors: unknown[] = [];
+      for (const data of ["four", Buffer.from("four"), new Blob(["four"])]) {
+        try {
+          ws.send(data as Buffer, error => void errors.push(error));
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      await new Promise(resolve => setImmediate(resolve));
+      expect({ readyState: ws.readyState, errors: errors.map(error => error instanceof Error) }).toEqual({
+        readyState: 0,
+        errors: [true, true, true],
+      });
+    } finally {
+      ws.terminate();
+      server.close();
+    }
+  });
+
+  // Not as npm ws, on purpose. npm ws copies the options with `{ ...options }`, which leaves out a property that is
+  // not enumerable. The built-in module reads an own `binary` of either kind: the check that it is enumerable is a
+  // call of propertyIsEnumerable() for each frame whose `binary` differs from the type of the data, the text echo.
+  it("reads a `binary` that is not enumerable in the built-in module only", async () => {
+    const [ofBytes, ofString] = implementation === "built-in" ? [TEXT, BINARY] : [BINARY, TEXT];
+    const rows: Row[] = [
+      ["Buffer, not enumerable false", bytes, hidden(false), ofBytes, hex],
+      ["ArrayBuffer, not enumerable 0", arrayBuffer, hidden(0), ofBytes, hex],
+      ["string, not enumerable true", () => text, hidden(true), ofString, hex],
+    ];
+    expect((await sendRows("server", false, rows)).frames).toEqual(onTheWire(rows));
+  });
+
+  // What send() of the built-in module does not do yet. The npm half runs each test, so each expectation is the
+  // output of npm ws.
+  const notYet = implementation === "built-in";
+
+  // npm ws sends data with `fin: false` as a fragment of a message. The first frame has the frame type, each frame
+  // after it is a continuation frame, and the first send() with no `fin: false` ends the message. The built-in
+  // module sends each one as a whole message.
+  it.todoIf(notYet)("sends data with `fin: false` as a fragment", async () => {
+    const frames: WireFrame[] = [];
+    const all = Promise.withResolvers<void>();
+    const connection = await openToRawPeer("server", false, frame => {
+      if (frames.push(frame) === 3) all.resolve();
+    });
+    try {
+      connection.ws.send(Buffer.from("a"), { binary: false, fin: false });
+      connection.ws.send("b", { fin: false });
+      connection.ws.send("c");
+      await Promise.race([all.promise, connection.failure]);
+      expect(frames).toEqual([
+        { fin: false, opcode: TEXT, payload: "61" },
+        { fin: false, opcode: 0, payload: "62" },
+        { fin: true, opcode: 0, payload: "63" },
+      ]);
+    } finally {
+      connection.close();
+    }
+  });
+
+  // npm ws makes a Buffer over the memory of an ArrayBuffer, and of a view that is not a Buffer. That throws when
+  // the memory is detached. The built-in module sends an empty frame.
+  it.todoIf(notYet)("throws for a detached ArrayBuffer and for a detached view", async () => {
+    const connection = await openToRawPeer("server", false, () => {});
+    try {
+      const detached = () => {
+        const view = new Uint8Array(4);
+        structuredClone(view.buffer, { transfer: [view.buffer] });
+        return view;
+      };
+      expect(() => connection.ws.send(detached().buffer)).toThrow(TypeError);
+      expect(() => connection.ws.send(detached(), { binary: false })).toThrow(TypeError);
+    } finally {
+      connection.close();
+    }
+  });
+});
+
+// The native client compresses a data frame of 860 bytes or more when the server accepts permessage-deflate.
+it("a client socket compresses bytes that it sends as a text frame, and a string that it sends as a binary frame", async () => {
+  const text = Buffer.alloc(2048, "text-\u4e16-").toString();
+  const received: { text: boolean; bytes: string }[] = [];
+  const all = Promise.withResolvers<void>();
+  await using server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch(request, server) {
+      return server.upgrade(request) ? undefined : new Response("no upgrade", { status: 400 });
+    },
+    websocket: {
+      perMessageDeflate: true,
+      message(ws, message) {
+        received.push({ text: typeof message === "string", bytes: Buffer.from(message).toString("hex") });
+        if (received.length === 2) all.resolve();
+      },
+    },
+  });
+  const client = new WebSocket("ws://127.0.0.1:" + server.port);
+  client.on("error", all.reject);
+  client.on("open", () => {
+    client.send(Buffer.from(text), { binary: false });
+    client.send(text, { binary: true });
+  });
+  try {
+    await all.promise;
+    const bytes = Buffer.from(text).toString("hex");
+    expect({ extensions: client.extensions, received }).toEqual({
+      extensions: expect.stringContaining("permessage-deflate"),
+      received: [
+        { text: true, bytes },
+        { text: false, bytes },
+      ],
+    });
+  } finally {
+    client.terminate();
   }
 });
 
