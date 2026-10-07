@@ -49,7 +49,13 @@ const kCloseCallback = Symbol("closeCallback");
 // per-connection queue without widening node:_http_server's exports. The
 // fallback loads node:http (and with it _http_server) before reading these.
 const http1ServerPipeline: {
-  queuePipelinedResponse?: (socket: unknown, res: unknown, isAncient: boolean) => void;
+  constructFallbackResponse?: (
+    ResponseClass: unknown,
+    req: unknown,
+    handle: unknown,
+    socket: unknown,
+    queued: boolean,
+  ) => any;
   advanceResponsePipeline?: (server: unknown, socket: unknown) => void;
   abortQueuedPipelinedResponses?: (socket: unknown) => void;
   lastPipelinedResponse?: (socket: unknown) => { _last: boolean } | undefined;
@@ -80,9 +86,21 @@ export const enum NodeHTTPResponseFlags {
   request_has_completed = 1 << 1,
   ended = 1 << 2,
   upgraded = 1 << 3,
+  /** The response has the connection. A queued one records its output until then. */
+  current = 1 << 4,
   dispatch_threw_while_queued = 1 << 9,
 
   closed_or_completed = socket_closed | request_has_completed,
+}
+
+/** What the grant of the connection to a queued response returns (GrantResult in NodeHTTPResponse.rs). */
+export const enum NodeHTTPGrantResult {
+  /** The connection is gone. */
+  gone = 0,
+  /** Nothing of what the response recorded waits for the socket. */
+  flushed = 1,
+  /** The socket has to drain first, like after an end() or a write() of the handle that returns a negative number. */
+  buffered = -1,
 }
 
 export const enum NodeHTTPHeaderState {
@@ -312,6 +330,13 @@ const STATUS_CODES = {
   511: "Network Authentication Required",
 };
 
+// The checks that the response handles make of the chunk of a write() or an
+// end(), with nothing converted or written: one rule for the native handle and
+// for the JS one. (chunk, encoding, typeOnly): `typeOnly` leaves the encoding
+// out, for a caller that judges the chunk before the point where Node.js
+// judges the encoding.
+const checkResponseChunk = $newRustFunction("node_http_binding.rs", "checkResponseChunk", 3);
+
 function hasServerResponseFinished(self, chunk, callback, fromEnd) {
   const finished = self.finished;
 
@@ -320,6 +345,8 @@ function hasServerResponseFinished(self, chunk, callback, fromEnd) {
     const destroyed = self.destroyed;
 
     if (finished || destroyed) {
+      // Node.js's write_() judges the type of the chunk first. Its end() reads `finished` before it calls write_().
+      if (!fromEnd) checkResponseChunk(chunk, undefined, true);
       let err;
       if (finished) {
         err = $ERR_STREAM_WRITE_AFTER_END();
@@ -337,6 +364,8 @@ function hasServerResponseFinished(self, chunk, callback, fromEnd) {
       return true;
     }
   } else if (finished) {
+    // A falsy chunk of write() that is no chunk at all (0, false) is judged first too.
+    if (!fromEnd) checkResponseChunk(chunk, undefined, true);
     if ($isCallable(callback)) {
       if (!self.writableFinished) {
         self.on("finish", callback);
@@ -526,6 +555,7 @@ export {
   STATUS_CODES,
   abortedSymbol,
   callCloseCallback,
+  checkResponseChunk,
   checkShouldUseProxy,
   drainMicrotasks,
   emitCloseNT,
