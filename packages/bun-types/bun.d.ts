@@ -2150,7 +2150,21 @@ declare module "bun" {
     input: Blob | NodeJS.TypedArray | ArrayBufferLike | string | BlobPart[] | Archive | ReadableStream,
     options?: {
       /**
-       * If writing to a PathLike, set the permissions of the file.
+       * Set the permissions of the destination file to exactly this mode. The
+       * process umask does not apply.
+       *
+       * A file that already exists is changed too. It stays the same file, so
+       * a descriptor that was opened earlier keeps its access. If the
+       * operating system refuses the change, the write is rejected. On a
+       * filesystem without POSIX permissions (FAT, exFAT, SMB) the mode can
+       * have no effect.
+       *
+       * Applies to a path destination: a path, or a `Bun.file(path)`. On
+       * Windows, only a `Bun.file()` input applies it.
+       *
+       * Must be an integer from 0 to 0o777 (511 in decimal).
+       *
+       * @throws {RangeError} If the mode is not an integer in that range.
        */
       mode?: number;
       /**
@@ -2181,6 +2195,24 @@ declare module "bun" {
     input: Response | Request,
     options?: {
       /**
+       * Set the permissions of the destination file to exactly this mode. The
+       * process umask does not apply.
+       *
+       * A file that already exists is changed too. It stays the same file, so
+       * a descriptor that was opened earlier keeps its access. If the
+       * operating system refuses the change, the write is rejected. On a
+       * filesystem without POSIX permissions (FAT, exFAT, SMB) the mode can
+       * have no effect.
+       *
+       * Applies to a path destination: a path, or a `Bun.file(path)`. On
+       * Windows, only a `Bun.file()` input applies it.
+       *
+       * Must be an integer from 0 to 0o777 (511 in decimal).
+       *
+       * @throws {RangeError} If the mode is not an integer in that range.
+       */
+      mode?: number;
+      /**
        * If `true`, create the parent directory if it doesn't exist.
        *
        * If `false`, the write throws an error when the directory doesn't exist.
@@ -2205,6 +2237,24 @@ declare module "bun" {
     destinationPath: PathLike,
     input: Response | Request,
     options?: {
+      /**
+       * Set the permissions of the destination file to exactly this mode. The
+       * process umask does not apply.
+       *
+       * A file that already exists is changed too. It stays the same file, so
+       * a descriptor that was opened earlier keeps its access. If the
+       * operating system refuses the change, the write is rejected. On a
+       * filesystem without POSIX permissions (FAT, exFAT, SMB) the mode can
+       * have no effect.
+       *
+       * Applies to a path destination: a path, or a `Bun.file(path)`. On
+       * Windows, only a `Bun.file()` input applies it.
+       *
+       * Must be an integer from 0 to 0o777 (511 in decimal).
+       *
+       * @throws {RangeError} If the mode is not an integer in that range.
+       */
+      mode?: number;
       /**
        * If `true`, create the parent directory if it doesn't exist.
        *
@@ -2239,12 +2289,21 @@ declare module "bun" {
     input: BunFile,
     options?: {
       /**
-       * Set the file permissions of the destination when it is created or overwritten.
+       * Set the permissions of the destination file to exactly this mode. The
+       * process umask does not apply.
        *
-       * Must be a valid Unix permission mode (0 to 0o777 / 511 in decimal).
-       * If omitted, defaults to the system default based on umask (typically 0o644).
+       * A file that already exists is changed too. It stays the same file, so
+       * a descriptor that was opened earlier keeps its access. If the
+       * operating system refuses the change, the write is rejected. On a
+       * filesystem without POSIX permissions (FAT, exFAT, SMB) the mode can
+       * have no effect.
        *
-       * @throws {RangeError} If the mode is outside the valid range (0 to 0o777).
+       * Applies to a path destination: a path, or a `Bun.file(path)`. On
+       * Windows, only a `Bun.file()` input applies it.
+       *
+       * Must be an integer from 0 to 0o777 (511 in decimal).
+       *
+       * @throws {RangeError} If the mode is not an integer in that range.
        *
        * @example
        * ```ts
@@ -2285,12 +2344,21 @@ declare module "bun" {
     input: BunFile,
     options?: {
       /**
-       * Set the file permissions of the destination when it is created or overwritten.
+       * Set the permissions of the destination file to exactly this mode. The
+       * process umask does not apply.
        *
-       * Must be a valid Unix permission mode (0 to 0o777 / 511 in decimal).
-       * If omitted, defaults to the system default based on umask (typically 0o644).
+       * A file that already exists is changed too. It stays the same file, so
+       * a descriptor that was opened earlier keeps its access. If the
+       * operating system refuses the change, the write is rejected. On a
+       * filesystem without POSIX permissions (FAT, exFAT, SMB) the mode can
+       * have no effect.
        *
-       * @throws {RangeError} If the mode is outside the valid range (0 to 0o777).
+       * Applies to a path destination: a path, or a `Bun.file(path)`. On
+       * Windows, only a `Bun.file()` input applies it.
+       *
+       * Must be an integer from 0 to 0o777 (511 in decimal).
+       *
+       * @throws {RangeError} If the mode is not an integer in that range.
        *
        * @example
        * ```ts
@@ -2756,7 +2824,27 @@ declare module "bun" {
      */
     write(
       data: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer | Request | Response | BunFile | ReadableStream,
-      options?: { highWaterMark?: number },
+      options?: {
+        highWaterMark?: number;
+        /**
+         * Set the permissions of the destination file to exactly this mode. The
+         * process umask does not apply.
+         *
+         * A file that already exists is changed too. It stays the same file, so
+         * a descriptor that was opened earlier keeps its access. If the
+         * operating system refuses the change, the write is rejected. On a
+         * filesystem without POSIX permissions (FAT, exFAT, SMB) the mode can
+         * have no effect.
+         *
+         * Applies when this file is a path: `Bun.file(path)`. On Windows, only
+         * a `Bun.file()` input applies it.
+         *
+         * Must be an integer from 0 to 0o777 (511 in decimal).
+         *
+         * @throws {RangeError} If the mode is not an integer in that range.
+         */
+        mode?: number;
+      },
     ): Promise<number>;
 
     /**
