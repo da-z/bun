@@ -123,6 +123,16 @@ export function pathToUpperSnakeCase(filepath: string) {
     .toUpperCase();
 }
 
+/**
+ * `<crate>=<a.bind.ts>` entries, from `--sources=` (comma-separated) or `--sources-file=` (one a line, as the build
+ * writes them: bindgenSourcesFile in scripts/build/codegen.ts), whichever is given; null with neither.
+ */
+export function sourcesOf(args: { sources?: unknown; "sources-file"?: unknown }): string[] | null {
+  const file = args["sources-file"];
+  if (typeof file === "string") return fs.readFileSync(file, "utf8").split(/\r?\n/).filter(line => line.length > 0);
+  return typeof args.sources === "string" ? args.sources.split(",").filter(source => source.length > 0) : null;
+}
+
 export function argParse(keys: string[]): any {
   const options: { [key: string]: boolean | string } = {};
   for (const arg of process.argv.slice(2)) {

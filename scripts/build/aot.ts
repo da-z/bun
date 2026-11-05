@@ -1,6 +1,6 @@
 import { readdirSync } from "node:fs";
 import { resolve } from "node:path";
-import { crateOf, debugFlag, shJoin, typesOnlyFlag, type Ctx } from "./codegen.ts";
+import { bindgenSourcesFile, debugFlag, shJoin, typesOnlyFlag, type Ctx } from "./codegen.ts";
 import type { CodegenFields } from "./config.ts";
 import { assert } from "./error.ts";
 
@@ -192,11 +192,13 @@ export function emitBuiltinsTable({ n, cfg, sources, o, dirStamp, engine }: Ctx)
   ];
   const outputs = [...rust, cpp, tableHeader, ...table, ...data, ...engine.builtinTableOutputs];
 
+  const sourcesFile = bindgenSourcesFile(cfg, sources);
   n.build({
     outputs,
     rule: "codegen_bun",
     inputs: [
       script,
+      sourcesFile,
       ...sources.builtinsTableCodegen.filter(path => path !== script),
       ...sources.bindgen,
       ...sources.js,
@@ -230,7 +232,7 @@ export function emitBuiltinsTable({ n, cfg, sources, o, dirStamp, engine }: Ctx)
         script,
         `--codegen-path=${cfg.codegenDir}`,
         `--target=${builtinTableTarget(cfg)}`,
-        `--sources=${sources.bindgen.map(src => `${crateOf(src)}=${src}`).join(",")}`,
+        `--sources-file=${sourcesFile}`,
         `--engine-directory=${engine.directory}`,
         ...(engine.javaScriptCore === undefined
           ? [`--prebuilt-generated=${engine.builtinsGeneratedDirectory}`]
